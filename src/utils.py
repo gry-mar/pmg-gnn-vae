@@ -1,3 +1,8 @@
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
+
 from itertools import zip_longest
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -9,128 +14,135 @@ from sklearn.manifold import TSNE
 from sklearn.metrics import mean_squared_error
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm, trange
+from models.VAE import VAE
+from sklearn.metrics import silhouette_score, davies_bouldin_score
 
-from src.ae import BaseAutoEncoder
+# training
+def training(name, max_patience, num_epochs, model, optimizer, training_loader, val_loader):
+    nll_val = []
+    best_nll = 1000.
+    patience = 0
 
-
-def train_ae(
-    model: BaseAutoEncoder,
-    epochs: int,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
-    lr: float,
-    loss_fn: callable,
-    loss_fn_args: Optional[Tuple[Any]] = None,
-) -> Tuple[Dict[str, List[float]], Dict[str, List[float]]]:
-    """Train AE model and plot metrics.
-    :param model: AE model
-    :param epochs: number of epochs to train
-    :param train_loader: train dataset loader
-    :param val_loader: validation dataset loader
-    :param lr: learning rate
-    :param loss_fn: loss function to be applied
-    :param loss_fn_kwargs: optional args to be passed to loss function
-        instead of input and output
-    :return: trained model
-    """
-    train_metrics = {
-        "loss": [],
-        "mse": [],
-        "step": [],
-    }
-    val_metrics = {
-        "loss": [],
-        "mse": [],
-        "step": [],
-    }
-
-    global_step = 0
-
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-
-    for epoch in trange(epochs, desc="epoch"):
-        
-        # training step
+    # Main loop
+    for e in range(num_epochs):
+        # TRAINING
         model.train()
-        pbar = tqdm(train_loader, desc="step", leave=False)
-        for inputs, _ in pbar:  # we are not using labels for training
+        for _, batch in enumerate(training_loader):
+            if hasattr(model, 'dequantization'):
+                if model.dequantization:
+                    batch = batch + torch.rand(batch.shape)
+            loss = model.forward(batch)
+
+
             optimizer.zero_grad()
-            reconstructions = model(inputs)
-            if loss_fn_args is None:
-                args = (reconstructions, inputs)
-            else:
-                args = (*loss_fn_args, inputs)
-            
-            loss = loss_fn(*args)
-            loss.backward()
+            loss.backward(retain_graph=True)
             optimizer.step()
-            
-            train_metrics["loss"].append(loss.item() / inputs.shape[0])
-            train_metrics["mse"].append(
-                mean_squared_error(
-                    inputs.detach().view(inputs.shape[0], -1), 
-                    reconstructions.detach().view(reconstructions.shape[0], -1),
-                )
-            )
-            train_metrics["step"].append(global_step)
 
-            global_step += 1
-            pbar.update(1)
-        pbar.close()
+        # Validation
+        loss_val = evaluation(val_loader, model_best=model, epoch=e)
+        nll_val.append(loss_val)  # save for plotting
 
-        # validation step
-        model.eval()
-        val_loss = 0.0
-        
-        with torch.no_grad():
-            total = 0
-            for inputs, _ in val_loader:
-                reconstructions = model(inputs)
-                if loss_fn_args is None:
-                    args = (reconstructions, inputs)
-                else:
-                    args = (*loss_fn_args, inputs)
+        if e == 0:
+            print('saved!')
+            torch.save(model, name + '.model')
+            best_nll = loss_val
+        else:
+            if loss_val < best_nll:
+                print('saved!')
+                torch.save(model, name + '.model')
+                best_nll = loss_val
+                patience = 0
 
-                val_loss += loss_fn(*args) / inputs.shape[0]
-                total += 1
-            
-        val_metrics["loss"].append(val_loss.item() / total)
-        val_metrics["mse"].append(
-            mean_squared_error(
-                inputs.view(inputs.shape[0], -1),
-                reconstructions.view(reconstructions.shape[0], -1))
-        )
-        val_metrics["step"].append(global_step)
+                samples_generated(name, val_loader, extra_name="_epoch_" + str(e))
+            else:
+                patience = patience + 1
 
-    plot_metrics(train_metrics, val_metrics)
-    return model
+        if patience > max_patience:
+            break
+
+    nll_val = np.asarray(nll_val)
+
+    return nll_val
 
 
-def plot_metrics(train_metrics: Dict[str, List[float]], val_metrics: Dict[str, List[float]]):
-    """Plot train and val metrics after training."""
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(5, 8), sharex=True)
-    
-    ax1.plot(train_metrics["step"], train_metrics["loss"], label="train loss")
-    ax1.plot(val_metrics["step"], val_metrics["loss"], label="val loss")
-    ax2.plot(train_metrics["step"], train_metrics["mse"], label="train mse")
-    ax2.plot(val_metrics["step"], val_metrics["mse"], label="val mse")
-    ax1.set_xlabel("Training step")
-    ax1.set_ylabel("Loss")
-    ax2.set_ylabel("MSE")
-    ax1.set_title("Learning curves")
-    ax1.grid()
-    ax1.legend()
-    ax2.grid()
-    ax2.legend()
-    plt.show()
 
 
-class AutoEncoderAnalyzer:
+
+def evaluation(test_loader, name=None, model_best=None, epoch=None):
+    # EVALUATION
+    if model_best is None:
+        # load best performing model
+        model_best = torch.load(name + '.model')
+
+    model_best.eval()
+    loss = 0.
+    N = 0.
+    for _, test_batch in enumerate(test_loader):
+        loss_t = model_best.forward(test_batch, reduction='sum')
+        loss = loss + loss_t.item()
+        N = N + test_batch.shape[0]
+    loss = loss / N
+
+    if epoch is None:
+        print(f'FINAL LOSS: nll={loss}')
+    else:
+        print(f'Epoch: {epoch}, val nll={loss}')
+    return loss
+
+
+
+def samples_generated(name, data_loader, extra_name=''):
+    x = next(iter(data_loader)).detach().numpy()
+
+    # GENERATIONS-------
+    model_best = torch.load(name + '.model')
+    model_best.eval()
+
+    num_x = 2
+    num_y = 2
+    x = model_best.sample(num_x * num_y)
+    x = x.detach().numpy()
+
+    fig, ax = plt.subplots(num_x, num_y)
+    for i, ax in enumerate(ax.flatten()):
+        plottable_image = np.reshape(x[i], (32, 32, 3))
+        ax.imshow(plottable_image, cmap='gray')
+        ax.axis('off')
+
+    plt.savefig(name + '_generated_images' + extra_name + '.pdf', bbox_inches='tight')
+    plt.close()
+
+def samples_real(name, test_loader):
+    # REAL-------
+    num_x = 2
+    num_y = 2
+    x = next(iter(test_loader)).detach().numpy()
+
+    fig, ax = plt.subplots(num_x, num_y)
+    for i, ax in enumerate(ax.flatten()):
+        plottable_image = np.reshape(x[i], (32, 32, 3))
+        ax.imshow(plottable_image, cmap='gray')
+        ax.axis('off')
+
+    plt.savefig(name+'_real_images.pdf', bbox_inches='tight')
+    plt.close()
+
+
+def plot_curve(name, nll_val):
+    plt.plot(np.arange(len(nll_val)), nll_val, linewidth='3')
+    plt.xlabel('epochs')
+    plt.ylabel('NLL')
+    plt.savefig(name + '_nll_val_curve.pdf', bbox_inches='tight')
+    plt.close()
+
+
+
+class VAEAnalyzer:
     """Class for analysing an autoencoder model."""
 
     def __init__(
         self,
-        model: BaseAutoEncoder,
+        model: VAE,
         dataset: Dataset,
         n_samplings: int = 1,
     ):
@@ -158,7 +170,7 @@ class AutoEncoderAnalyzer:
 
     def _retrieve_reconstructions(self):
         """Get data for analysis."""
-        loader = DataLoader(self.dataset, batch_size=20, shuffle=False, drop_last=True)
+        loader = DataLoader(self.dataset, batch_size=64, shuffle=False, drop_last=True)
 
         inps = []
         lats = []
@@ -169,141 +181,31 @@ class AutoEncoderAnalyzer:
             reconstructions = []
             latents = []
             for _ in range(self.n_samplings):
-                latents.append(self.model.encoder_forward(inputs).detach())
-                reconstructions.append(self.model(inputs).detach())
+                latents.append(self.model.sample(inputs, is_decoder=False).detach())
+                reconstructions.append(self.model.sample(inputs).detach())
             inps.append(inputs)
             lats.append(torch.stack(latents, dim=1))
             recs.append(torch.stack(reconstructions, dim=1))
             lbls.append(labels)
 
-        self._inputs = torch.cat(inps, dim=0).view(-1, 28, 28)
+        self._inputs = torch.cat(inps, dim=0).view(-1, 32, 32, 3)
         self._latents = torch.cat(lats, dim=0).view(
-            -1, self.n_samplings, self.model.n_latent_features
+            -1, self.n_samplings, self.model.L
         )
         self._reconstructions = torch.cat(recs, dim=0).view(
-            -1, self.n_samplings, 28, 28
+            -1, self.n_samplings, 32, 32, 3
         )
         self._labels = torch.cat(lbls, dim=0).view(-1)
         self._plot_indices = np.random.permutation(len(self._inputs))
 
-    def compare_reconstruction_with_original(self):
-        """Plot comparison between original image and its reconstruction."""
-        indices = self._plot_indices[:50]
-        inputs = self._inputs[indices]
-        reconstructions = self._reconstructions[indices, 0, ...].unsqueeze(1)
-        labels = self._labels[indices]
-
-        visualize_samples(
-            images=inputs,
-            other_images=reconstructions,
-            labels=labels.numpy(),
-            n_cols=5,
-            title="Inputs with reconstructions by AE",
-        )
-
-    def compare_samplings(self):
-        """Plot comparison between samplings."""
-        indices = self._plot_indices[:20]
-        inputs = self._inputs[indices]
-        reconstructions = self._reconstructions[indices]
-        labels = self._labels[indices]
-
-        visualize_samples(
-            images=inputs,
-            other_images=reconstructions,
-            labels=labels.numpy(),
-            n_cols=2,
-            title="Inputs reconstructions - all samplings",
-        )
-
-    def average_points_per_class(self):
-        """Calculate each class average points."""
-        labels = self._labels.numpy()
-        avgs = []
-        for cls in np.sort(np.unique(labels)):
-            cls_indices = np.where(labels == cls)
-            self._class_indices[cls] = cls_indices
-            class_latents = self._latents[list(cls_indices)].view(
-                -1, self.model.n_latent_features
-            )
-            avgs.append(torch.mean(class_latents, dim=0))
-        self._averages = torch.stack(avgs, dim=0)
-        reconstructed = (
-            self.model.decoder_forward(self._averages).detach().view(-1, 28, 28)
-        )
-        visualize_samples(
-            images=reconstructed,
-            labels=np.sort(np.unique(labels)),
-            title="Reconstructed average representations per class",
-        )
-
-    def analyze_features(self, latent_code: torch.Tensor, steps: int = 11):
-        """Perform latent feature analysis for a given latent code."""
-        min_value = torch.floor(torch.min(self._latents)).item()
-        max_value = torch.ceil(torch.max(self._latents)).item()
-        print(f"Researching values in range [{min_value}, {max_value}]")
-        latent_values = np.linspace(min_value, max_value, steps)
-        reconstructed = []
-        for idx in range(len(latent_code)):
-            latents = []
-            for latent_value in latent_values:
-                new_latent = latent_code.clone()
-                new_latent[idx] = latent_value
-                latents.append(new_latent)
-            feature_latents = torch.stack(latents, dim=0)
-            feature_reconstructed = (
-                self.model.decoder_forward(feature_latents).detach().view(-1, 28, 28)
-            )
-            reconstructed.append(feature_reconstructed)
-        images = torch.stack(reconstructed, dim=0).view(-1, 28, 28)
-        fig = visualize_samples(
-            images=images, title="Latent features analysis", n_cols=steps
-        )
-        fig.text(
-            0.5,
-            0.0,
-            f"latent feature value in range [{min_value}, {max_value}]",
-            ha="center",
-            va="center",
-        )
-        fig.text(
-            0.0,
-            0.5,
-            "latent feature index",
-            ha="center",
-            va="center",
-            rotation="vertical",
-        )
-        for feature_idx, axis in enumerate(fig.axes[::steps], 1):
-            axis.set_ylabel(feature_idx)
-        for feature_value_idx, axis in enumerate(fig.axes[-steps:]):
-            axis.set_xlabel(round(latent_values[feature_value_idx], 1))
-
-    def analyze_tsne(self):
-        """Plot TSNE analysis of latent space."""
-        tsne = TSNE(n_components=2)
-        labels = self._labels.numpy()
-        all_latents = torch.cat((self._latents[:, 0, :], self._averages), dim=0)
-        embedded = tsne.fit_transform(all_latents.numpy())
-
-        fig, ax = plt.subplots(figsize=(5, 5))
-        for cls in np.sort(np.unique(labels)):
-            class_embedded = embedded[self._class_indices[cls]]
-            ax.scatter(class_embedded[:, 0], class_embedded[:, 1], label=cls, s=3)
-
-        averages_embedded = embedded[
-            len(labels) : len(labels) + len(self._class_indices)
-        ]
-        ax.scatter(
-            averages_embedded[:, 0],
-            averages_embedded[:, 1],
-            s=50,
-            c="k",
-            marker="X",
-        )
-
-        ax.set_title("t-SNE analysis")
-        ax.legend(loc="center left", bbox_to_anchor=(1, 0.5), scatterpoints=10)
+    def get_metrics(self):
+        x = self._reconstructions.reshape(self._reconstructions.shape[0], -1)
+        silh = silhouette_score(X=x, labels=self._labels)
+        dav = davies_bouldin_score(X=x, labels=self._labels)
+        print(f"Silhouette score: {silh}")
+        print(f"Davies Bouldin Index: {dav}")
+        return silh, dav
+        
 
 
 def visualize_samples(
